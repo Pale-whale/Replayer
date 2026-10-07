@@ -25,7 +25,7 @@ func TestBuildLocal(t *testing.T) {
 		if r.TeamSize != 2 || !slices.Equal(r.Coached(players), players) {
 			continue
 		}
-		rep, err := analysis.File(r)
+		rep, err := analysis.File(r, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -3,7 +3,9 @@
 package tui
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -14,8 +16,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"replayer/internal/analysis"
+	"replayer/internal/benchmark"
 	"replayer/internal/coach"
+	"replayer/internal/config"
 	"replayer/internal/replay"
+	"replayer/internal/store"
 	"replayer/internal/trends"
 )
 
@@ -25,11 +30,15 @@ var (
 	keyMark   = key.NewBinding(key.WithKeys(" "), key.WithHelp("espace", "cocher"))
 	keyUnmark = key.NewBinding(key.WithKeys("x"), key.WithHelp("x", "tout décocher"))
 	keyTrends = key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "tendances"))
+	keyBench  = key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "réf. ballchasing"))
+	keyPrompt = key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "éditer le prompt du coach"))
 	keyBack   = key.NewBinding(key.WithKeys("esc", "q"), key.WithHelp("esc", "retour"))
 )
 
 // Number of replays analysed in parallel (each one runs rrrocket).
 const analysisWorkers = 4
+
+const loadingStatus = "chargement des analyses (les nouveaux replays sont analysés, ~0,3 s chacun)…"
 
 type item struct {
 	r       *replay.Replay
@@ -99,9 +108,25 @@ type reportsMsg struct {
 
 type coachDoneMsg struct{ err error }
 
+// benchProgressMsg reports the progress of a ballchasing benchmark build;
+// the build goroutine sends them, then a benchDoneMsg, on ch.
+type benchProgressMsg struct {
+	text string
+	ch   chan tea.Msg
+}
+
+type benchDoneMsg struct{ err error }
+
+type editDoneMsg struct{ err error }
+
+func listen(ch chan tea.Msg) tea.Cmd { return func() tea.Msg { return <-ch } }
+
 type Model struct {
 	list    list.Model
 	vp      viewport.Model
+	cfg     config.Config
+	store   store.Store
+	replays []*replay.Replay
 	players []string
 	page    page
 
@@ -109,16 +134,20 @@ type Model struct {
 	trends       *trends.Trends
 	trendReplays []*replay.Replay
 
-	// Analysis cache, by replay ID.
+	// Analyses by replay ID (backed by the store cache) and the level
+	// references by playlist, reset when the analyses change.
 	reports    map[string]*analysis.Report
 	reportErrs map[string]error
+	benches    map[string]*benchmark.Benchmark
+	building   bool
 
 	status    string
 	statusErr bool
 	width     int
 }
 
-func New(replays []*replay.Replay, players []string, warnings []error) Model {
+func New(replays []*replay.Replay, cfg config.Config, warnings []error) Model {
+	players := cfg.Players
 	items := make([]list.Item, len(replays))
 	for i, r := range replays {
 		items[i] = item{r: r, players: players}
@@ -126,18 +155,59 @@ func New(replays []*replay.Replay, players []string, warnings []error) Model {
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
 	l.Title = fmt.Sprintf("Replays Rocket League (%d)", len(replays))
 	l.AdditionalShortHelpKeys = func() []key.Binding { return []key.Binding{keyDetail, keyCoach, keyMark, keyTrends} }
-	l.AdditionalFullHelpKeys = func() []key.Binding { return []key.Binding{keyDetail, keyCoach, keyMark, keyUnmark, keyTrends} }
-	m := Model{list: l, vp: viewport.New(0, 0), players: players,
-		reports: map[string]*analysis.Report{}, reportErrs: map[string]error{}}
+	l.AdditionalFullHelpKeys = func() []key.Binding {
+		return []key.Binding{keyDetail, keyCoach, keyMark, keyUnmark, keyTrends, keyBench, keyPrompt}
+	}
+	m := Model{list: l, vp: viewport.New(0, 0), cfg: cfg, store: store.Store{Dir: cfg.Workdir, Aliases: cfg.Aliases},
+		replays: replays, players: players,
+		reports: map[string]*analysis.Report{}, reportErrs: map[string]error{}, benches: map[string]*benchmark.Benchmark{}}
+	m.setStatus(loadingStatus, false)
 	if len(warnings) > 0 {
 		m.setStatus(fmt.Sprintf("%d replay(s) illisible(s), ex : %v", len(warnings), warnings[0]), true)
 	}
 	return m
 }
 
-func (m *Model) setStatus(s string, isErr bool) { m.status, m.statusErr = s, isErr }
+// Init loads (or computes) the analysis of every replay in the background,
+// for the history and the local reference.
+func (m Model) Init() tea.Cmd {
+	return m.analyze(m.replays, func(m *Model) tea.Cmd {
+		if m.status == loadingStatus {
+			m.setStatus("", false)
+			if n := len(m.reportErrs); n > 0 {
+				m.setStatus(fmt.Sprintf("%d replay(s) non analysable(s)", n), true)
+			}
+		}
+		return nil
+	})
+}
 
-func (m Model) Init() tea.Cmd { return nil }
+func (m *Model) env() coach.Env {
+	return coach.Env{Store: m.store, Players: m.players, Rank: m.cfg.RankFor,
+		Replays: m.replays, Reports: m.reports, Bench: m.bench}
+}
+
+// bench returns the level reference of a playlist: the ballchasing one of
+// the configured rank if built, else the local one.
+func (m *Model) bench(playlist string) *benchmark.Benchmark {
+	if b, ok := m.benches[playlist]; ok {
+		return b
+	}
+	var b *benchmark.Benchmark
+	if rk := m.cfg.RankFor(playlist); rk != "" {
+		b = benchmark.Load(m.store.BenchmarkDir(playlist, rk))
+	}
+	if b == nil {
+		b = benchmark.Local(m.replays, m.reports, m.players, playlist, 30)
+	}
+	if b.Players == 0 {
+		b = nil
+	}
+	m.benches[playlist] = b
+	return b
+}
+
+func (m *Model) setStatus(s string, isErr bool) { m.status, m.statusErr = s, isErr }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -154,9 +224,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for id, err := range msg.errs {
 			m.reportErrs[id] = err
 		}
+		clear(m.benches)
 		cmd := msg.then(&m)
 		m.refresh()
 		return m, cmd
+	case benchProgressMsg:
+		m.setStatus(msg.text, false)
+		return m, listen(msg.ch)
+	case benchDoneMsg:
+		m.building = false
+		clear(m.benches)
+		m.setStatus("référence ballchasing prête", false)
+		if msg.err != nil {
+			m.setStatus("référence ballchasing : "+msg.err.Error(), true)
+		}
+		m.refresh()
+		return m, nil
+	case editDoneMsg:
+		m.setStatus("prompt du coach enregistré : il servira à la prochaine session", false)
+		if msg.err != nil {
+			m.setStatus("éditeur : "+msg.err.Error(), true)
+		}
+		return m, nil
 	case coachDoneMsg:
 		m.setStatus("", false)
 		if msg.err != nil {
@@ -208,6 +297,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			case key.Matches(msg, keyTrends):
 				return m, m.startTrends()
+			case key.Matches(msg, keyBench):
+				return m, m.startBench()
+			case key.Matches(msg, keyPrompt):
+				return m, m.editPrompt()
 			}
 		}
 	}
@@ -236,7 +329,7 @@ func (m *Model) analyze(rs []*replay.Replay, then func(*Model) tea.Cmd) tea.Cmd 
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
-				rep, err := analysis.File(r)
+				rep, err := m.store.Analysis(r)
 				mu.Lock()
 				defer mu.Unlock()
 				if err != nil {
@@ -261,11 +354,10 @@ func (m *Model) startCoach(it item) tea.Cmd {
 	m.setStatus("analyse du replay…", false)
 	return m.analyze([]*replay.Replay{it.r}, func(m *Model) tea.Cmd {
 		m.setStatus("", false)
-		rep := m.reports[it.r.ID]
-		if rep == nil {
+		if m.reports[it.r.ID] == nil {
 			m.setStatus(fmt.Sprintf("analyse des frames impossible, coaching sur les stats de fin de match : %v", m.reportErrs[it.r.ID]), true)
 		}
-		cmd, err := coach.Command(it.r, rep, m.players)
+		cmd, err := coach.Command(m.env(), it.r)
 		if err != nil {
 			m.setStatus("préparation du coaching impossible : "+err.Error(), true)
 			return nil
@@ -314,12 +406,68 @@ func (m *Model) startTrendsCoach() tea.Cmd {
 	if !claudeAvailable(m) {
 		return nil
 	}
-	cmd, err := coach.TrendsCommand(m.trends, m.trendReplays, m.reports)
+	cmd, err := coach.TrendsCommand(m.env(), m.trends, m.trendReplays)
 	if err != nil {
 		m.setStatus("préparation du coaching impossible : "+err.Error(), true)
 		return nil
 	}
 	return tea.ExecProcess(cmd, func(err error) tea.Msg { return coachDoneMsg{err} })
+}
+
+// startBench downloads replays of the configured rank from ballchasing.com
+// for the playlist of the selected replay and builds the reference.
+func (m *Model) startBench() tea.Cmd {
+	it, ok := m.list.SelectedItem().(item)
+	if !ok || m.building {
+		return nil
+	}
+	rep := m.reports[it.r.ID]
+	switch {
+	case m.cfg.BallchasingToken == "":
+		m.setStatus("ajoute ballchasing_token dans la config (token sur "+benchmark.TokenURL+")", true)
+		return nil
+	case rep == nil:
+		m.setStatus("analyse de ce replay pas encore disponible", true)
+		return nil
+	case !rep.Ranked:
+		m.setStatus("ce replay n'est pas un match classé ("+rep.Playlist+")", true)
+		return nil
+	case m.cfg.RankFor(rep.Playlist) == "":
+		m.setStatus("aucun rang configuré pour "+rep.Playlist+" (rank / ranks dans la config)", true)
+		return nil
+	}
+	playlist, rk := rep.Playlist, m.cfg.RankFor(rep.Playlist)
+	dir := m.store.BenchmarkDir(playlist, rk)
+	m.building = true
+	ch := make(chan tea.Msg)
+	go func() {
+		bc := benchmark.Ballchasing{Token: m.cfg.BallchasingToken}
+		_, err := bc.Build(context.Background(), playlist, rk, dir, func(s string) { ch <- benchProgressMsg{s, ch} })
+		ch <- benchDoneMsg{err}
+	}()
+	return listen(ch)
+}
+
+// editPrompt opens the editable coach prompt files in $VISUAL / $EDITOR
+// (nano or vi if unset).
+func (m *Model) editPrompt() tea.Cmd {
+	files, err := coach.PromptFiles(m.store)
+	if err != nil {
+		m.setStatus("prompt du coach : "+err.Error(), true)
+		return nil
+	}
+	editor := strings.Fields(os.Getenv("VISUAL"))
+	if len(editor) == 0 {
+		editor = strings.Fields(os.Getenv("EDITOR"))
+	}
+	if len(editor) == 0 {
+		editor = []string{"vi"}
+		if _, err := exec.LookPath("nano"); err == nil {
+			editor = []string{"nano"}
+		}
+	}
+	cmd := exec.Command(editor[0], append(editor[1:], files...)...)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg { return editDoneMsg{err} })
 }
 
 func claudeAvailable(m *Model) bool {

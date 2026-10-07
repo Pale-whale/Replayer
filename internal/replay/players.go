@@ -2,6 +2,23 @@ package replay
 
 import "slices"
 
+// ApplyAliases renames the players known under another name (alias -> main
+// name) in the scoreboard, the goals and the recorder.
+func (r *Replay) ApplyAliases(aliases map[string]string) {
+	rename := func(s *string) {
+		if n, ok := aliases[*s]; ok {
+			*s = n
+		}
+	}
+	for i := range r.Players {
+		rename(&r.Players[i].Name)
+	}
+	for i := range r.Goals {
+		rename(&r.Goals[i].Player)
+	}
+	rename(&r.Recorder)
+}
+
 // Coached returns the configured players present in r, or the recorder if
 // none is configured or present.
 func (r *Replay) Coached(players []string) []string {

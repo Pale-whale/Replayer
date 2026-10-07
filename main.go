@@ -38,8 +38,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, "lecture des replays:", errs[0])
 		os.Exit(1)
 	}
+	for _, r := range replays {
+		r.ApplyAliases(cfg.Aliases)
+	}
 
-	if _, err := tea.NewProgram(tui.New(replays, cfg.Players, errs), tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(tui.New(replays, cfg, errs), tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

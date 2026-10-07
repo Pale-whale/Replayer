@@ -111,3 +111,81 @@ func TestKickoffs(t *testing.T) {
 		t.Errorf("%d replays with unexpected kickoff count", badCount)
 	}
 }
+
+// Every in-play touch falls in exactly one possession category.
+func TestPossessionSums(t *testing.T) {
+	for _, r := range demos(t) {
+		nr, err := decode(r.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range analyze(r, nr).Players {
+			if p.TouchesInPlay == 0 {
+				continue
+			}
+			sum := p.FollowedSelfPct + p.FollowedMatePct + p.GivenPct + p.FiftyPct + p.UnfollowedPct
+			if math.Abs(sum-100) > 0.6 || math.Abs(p.KeptPct-p.FollowedSelfPct-p.FollowedMatePct) > 0.2 {
+				t.Errorf("%s %s: categories sum to %.1f", filepath.Base(r.Path), p.Name, sum)
+			}
+			if p.FiftyWon+p.FiftyLost > p.FiftyFifties {
+				t.Errorf("%s %s: 50/50 outcomes", filepath.Base(r.Path), p.Name)
+			}
+		}
+	}
+}
+
+// Compares the detected 50/50s with the ones of the exact BallTouches
+// counter: touches of both teams less than 0.3 s apart.
+func TestFiftyFifty(t *testing.T) {
+	var exact, found, matched, good int
+	for _, r := range demos(t) {
+		nr, err := decode(r.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tl := buildTimeline(nr)
+		if len(tl.Touches) == 0 {
+			continue
+		}
+		rep := analyze(r, nr)
+		team := map[string]int{}
+		for _, p := range rep.Players {
+			team[p.Name] = p.Team
+		}
+		var exactTouches []detectedTouch
+		for _, e := range tl.Touches {
+			exactTouches = append(exactTouches, detectedTouch{touch: e, Team: team[e.Player]})
+		}
+		p := newPeriods(tl.Snaps, tl.KickoffStarts)
+		duelTimes := func(ts []detectedTouch, useContact bool) []float64 {
+			var out []float64
+			for _, c := range clusters(inPlayTouches(ts, rep.Kickoffs), p) {
+				both := false
+				for _, x := range c.touches {
+					both = both || x.Team != c.touches[0].Team || (useContact && x.Contested)
+				}
+				if both {
+					out = append(out, c.touches[0].Time)
+				}
+			}
+			return out
+		}
+		ex, det := duelTimes(exactTouches, false), duelTimes(detectTouches(tl.Snaps), true)
+		near := func(a float64, bs []float64) bool {
+			return slices.ContainsFunc(bs, func(b float64) bool { return math.Abs(a-b) < 0.4 })
+		}
+		exact, found = exact+len(ex), found+len(det)
+		for _, e := range ex {
+			if near(e, det) {
+				matched++
+			}
+		}
+		for _, d := range det {
+			if near(d, ex) {
+				good++
+			}
+		}
+	}
+	t.Logf("50/50: exact=%d detected=%d (recall %.0f%%, precision %.0f%%)",
+		exact, found, 100*float64(matched)/float64(exact), 100*float64(good)/float64(found))
+}

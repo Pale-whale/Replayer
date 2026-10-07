@@ -5,7 +5,9 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strings"
 
+	"replayer/internal/rank"
 	"replayer/internal/replay"
 )
 
@@ -21,7 +23,15 @@ const (
 	touchLookback = 10.0  // seconds before a goal for the touch sequence
 )
 
+// Version of the report format: cached reports of another version are
+// recomputed.
+const Version = 2
+
 type Report struct {
+	Version       int             `json:"version"`
+	AliasesKey    string          `json:"aliases_key,omitempty"`
+	Playlist      string          `json:"playlist"`
+	Ranked        bool            `json:"ranked"`
 	Notes         []string        `json:"notes"`
 	InPlaySeconds float64         `json:"in_play_seconds"`
 	Players       []PlayerMetrics `json:"players"`
@@ -70,6 +80,18 @@ type PlayerMetrics struct {
 	KickoffsWent     int `json:"kickoffs_went"`
 	KickoffsWentWon  int `json:"kickoffs_went_won"`
 	KickoffsWentLost int `json:"kickoffs_went_lost"`
+
+	// Possession: what follows each in-play touch (kickoffs excluded).
+	TouchesInPlay   int     `json:"touches_in_play"`
+	FollowedSelfPct float64 `json:"touches_followed_by_self_pct"`
+	FollowedMatePct float64 `json:"touches_followed_by_teammate_pct"`
+	KeptPct         float64 `json:"touches_kept_by_team_pct"`
+	GivenPct        float64 `json:"touches_given_to_opponent_pct"`
+	FiftyPct        float64 `json:"fifty_fifty_pct"`
+	UnfollowedPct   float64 `json:"touches_unfollowed_pct"`
+	FiftyFifties    int     `json:"fifty_fifties"`
+	FiftyWon        int     `json:"fifty_fifty_won"`
+	FiftyLost       int     `json:"fifty_fifty_lost"`
 }
 
 type GoalContext struct {
@@ -79,6 +101,9 @@ type GoalContext struct {
 	LastTouches []TouchEvent  `json:"last_touches"`
 	Positioning []PlayerState `json:"positioning_2s_before"`
 	MissingCars []string      `json:"demolished_or_respawning_2s_before,omitempty"`
+	BallHeight  int           `json:"ball_height_pct_2s_before"`
+	// Field seen from above 2 s before the goal, then its legend.
+	FieldMap []string `json:"field_map_2s_before,omitempty"`
 }
 
 type TouchEvent struct {
@@ -91,12 +116,14 @@ type TouchEvent struct {
 
 type PlayerState struct {
 	Player     string `json:"player"`
+	Label      string `json:"map_label"`
 	Team       int    `json:"team"`
 	Zone       string `json:"zone"`
 	BallDist   int    `json:"distance_to_ball"`
 	Boost      int    `json:"boost"`
 	BehindBall bool   `json:"behind_ball"`
 	Speed      int    `json:"speed"`
+	Height     int    `json:"height_pct"`
 }
 
 type Demo struct {
@@ -106,19 +133,42 @@ type Demo struct {
 }
 
 // File decodes the replay with rrrocket and builds its coaching report.
-func File(r *replay.Replay) (*Report, error) {
+// aliases renames players (alias -> main name); r must already have them
+// applied (replay.ApplyAliases).
+func File(r *replay.Replay, aliases map[string]string) (*Report, error) {
 	nr, err := decode(r.Path)
 	if err != nil {
 		return nil, err
 	}
-	return analyze(r, nr), nil
+	nr.aliases = aliases
+	rep := analyze(r, nr)
+	rep.AliasesKey = AliasesKey(aliases)
+	return rep, nil
+}
+
+// AliasesKey identifies a set of aliases: a cached report made with other
+// aliases has other player names and must be recomputed.
+func AliasesKey(aliases map[string]string) string {
+	var pairs []string
+	for a, n := range aliases {
+		pairs = append(pairs, a+"="+n)
+	}
+	sort.Strings(pairs)
+	return strings.Join(pairs, ";")
+}
+
+func alias(aliases map[string]string, name string) string {
+	if n, ok := aliases[name]; ok {
+		return n
+	}
+	return name
 }
 
 func analyze(r *replay.Replay, nr *netReplay) *Report {
 	tl := buildTimeline(nr)
 	touches := detectTouches(tl.Snaps)
 
-	rep := &Report{Notes: []string{
+	rep := &Report{Version: Version, Playlist: rank.PlaylistName(tl.Playlist), Ranked: rank.Ranked(tl.Playlist), Notes: []string{
 		"Distances en uu (1 uu = 1 cm), vitesses en uu/s (max 2300, supersonique >= 2200). Boost en % (0-100).",
 		"Les pourcentages sont calculés sur le temps de jeu actif (hors compte à rebours et célébrations de but).",
 		"Zones (tiers défensif/milieu/offensif) toujours du point de vue du joueur concerné. team 0 = bleu, team 1 = orange.",
@@ -126,6 +176,8 @@ func analyze(r *replay.Replay, nr *netReplay) *Report {
 		"Les touches de balle sont détectées par heuristique (changement de vitesse de la balle + voiture à proximité) : quelques erreurs possibles.",
 		"low_air_or_wall / high_air_or_wall : la hauteur ne distingue pas le vol du roulage au mur.",
 		"Kickoffs : went = le joueur de l'équipe le plus proche de la balle à la 1re touche (personne si > 800 uu : fake). winner = équipe qui marque dans les 3 s après la 1re touche, sinon moitié de terrain où est la balle 3 s après (neutre à moins de 1000 uu du milieu). time_to_ball = secondes entre le top départ et la 1re touche (la balle quitte le centre). En prolongation, clock = temps écoulé depuis le début de la prolongation.",
+		"Possession (touches en jeu = hors contact de kickoff) : chaque touche est classée selon la touche suivante : même joueur (followed_by_self), coéquipier (followed_by_teammate ; kept_by_team = les deux), adversaire (given_to_opponent : balle rendue), ou aucune (unfollowed : but ou fin). Une touche est un 50/50 si les deux équipes touchent la balle à moins de 0,3 s d'intervalle ou si un adversaire est au contact ; le 50/50 est gagné par l'équipe qui touche la balle ensuite (ou qui marque).",
+		"Hauteurs en % du plafond (2044 uu ; approximatif en hoops). field_map : terrain vu de dessus, but bleu à gauche ; 1 2 3 = bleus, A B C = orange, o = balle ; : = limites des tiers, | = milieu.",
 	}}
 
 	stats := map[string]*PlayerMetrics{}
@@ -251,6 +303,20 @@ func analyze(r *replay.Replay, nr *netReplay) *Report {
 		}
 	}
 
+	poss := possession(touches, rep.Kickoffs, newPeriods(tl.Snaps, tl.KickoffStarts), r.Goals)
+	for name, ps := range poss {
+		m := stats[name]
+		if m == nil || ps.inPlay == 0 {
+			continue
+		}
+		n := float64(ps.inPlay)
+		m.TouchesInPlay = ps.inPlay
+		m.FollowedSelfPct, m.FollowedMatePct = pct(float64(ps.self), n), pct(float64(ps.mate), n)
+		m.KeptPct = pct(float64(ps.self+ps.mate), n)
+		m.GivenPct, m.FiftyPct, m.UnfollowedPct = pct(float64(ps.opp), n), pct(float64(ps.fifty), n), pct(float64(ps.none), n)
+		m.FiftyFifties, m.FiftyWon, m.FiftyLost = ps.duels, ps.duelsWon, ps.duelsLost
+	}
+
 	for name, m := range stats {
 		a := acc[name]
 		t := m.InPlaySeconds
@@ -298,6 +364,8 @@ type detectedTouch struct {
 	touch
 	Team int
 	Ball vec
+	// An opposing car was also within touch distance of the ball.
+	Contested bool
 }
 
 // detectTouches finds ball touches: a sudden change of the ball velocity
@@ -322,7 +390,8 @@ func detectTouches(snaps []snapshot) []detectedTouch {
 		if n := len(out); n > 0 && out[n-1].Player == c.Player && b.Time-out[n-1].Time < 0.25 {
 			continue // same contact spread over several frames
 		}
-		out = append(out, detectedTouch{touch: touch{Frame: b.Frame, Time: b.Time, Player: c.Player}, Team: c.Team, Ball: b.Ball})
+		contested := slices.ContainsFunc(b.Cars, func(o carSnap) bool { return o.Team != c.Team && dist(o.Pos, b.Ball) <= fiftyContactDist })
+		out = append(out, detectedTouch{touch: touch{Frame: b.Frame, Time: b.Time, Player: c.Player}, Team: c.Team, Ball: b.Ball, Contested: contested})
 	}
 	return out
 }
@@ -356,14 +425,18 @@ func goalContext(g replay.Goal, snaps []snapshot, touches []detectedTouch) GoalC
 	}
 	s := snaps[k]
 	present := map[string]bool{}
+	labels := mapLabels(s.Cars)
 	for _, c := range s.Cars {
 		present[c.Player] = true
 		gc.Positioning = append(gc.Positioning, PlayerState{
-			Player: c.Player, Team: c.Team, Zone: zoneName(zone(norm(c.Team, c.Pos.Y))),
+			Player: c.Player, Label: labels[c.Player], Team: c.Team, Zone: zoneName(zone(norm(c.Team, c.Pos.Y))),
 			BallDist: int(dist(c.Pos, s.Ball)), Boost: int(math.Round(c.Boost)),
 			BehindBall: norm(c.Team, c.Pos.Y) < norm(c.Team, s.Ball.Y), Speed: int(norm3(c.Vel)),
+			Height: heightPct(c.Pos.Z),
 		})
 	}
+	gc.BallHeight = heightPct(s.Ball.Z)
+	gc.FieldMap = fieldMap(s, labels)
 	sort.Slice(gc.Positioning, func(a, b int) bool {
 		pa, pb := gc.Positioning[a], gc.Positioning[b]
 		return pa.Team < pb.Team || pa.Team == pb.Team && pa.Player < pb.Player

@@ -68,6 +68,9 @@ var Metrics = []Metric{
 	{"first_man_pct", "1er%", "1er homme", func(p PlayerMatch) float64 { return p.FirstManPct }},
 	{"supersonic_pct", "SS%", "supersonique", func(p PlayerMatch) float64 { return p.SupersonicPct }},
 	{"touches", "Touch", "touches", func(p PlayerMatch) float64 { return float64(p.Touches) }},
+	{"touches_kept_by_team_pct", "Suiv%", "touches suivies d'une touche de son équipe", func(p PlayerMatch) float64 { return p.KeptPct }},
+	{"touches_given_to_opponent_pct", "Rend%", "touches rendues à l'adversaire", func(p PlayerMatch) float64 { return p.GivenPct }},
+	{"fifty_fifty_pct", "50%", "touches en 50/50", func(p PlayerMatch) float64 { return p.FiftyPct }},
 	{"kickoffs_went", "KO", "kickoffs allés", func(p PlayerMatch) float64 { return float64(p.KickoffsWent) }},
 	{"kickoffs_went_won", "KO+", "kickoffs gagnés", func(p PlayerMatch) float64 { return float64(p.KickoffsWentWon) }},
 	{"conceded_not_behind_ball", "BE!", "buts encaissés en étant devant la balle", func(p PlayerMatch) float64 { return float64(p.ConcededNotBehind) }},
@@ -188,3 +191,89 @@ func mean(ms []PlayerMatch, met Metric) float64 {
 }
 
 func round(x float64) float64 { return math.Round(x*10) / 10 }
+
+// History is the evolution of the coached players over their past matches
+// of a playlist, for the coach memory.
+type History struct {
+	Notes    []string        `json:"notes"`
+	Playlist string          `json:"playlist"`
+	Players  []PlayerHistory `json:"players"`
+}
+
+type PlayerHistory struct {
+	Name           string             `json:"name"`
+	Matches        []HistoryMatch     `json:"matches"` // oldest first
+	Last10Mean     map[string]float64 `json:"last10_mean"`
+	Previous10Mean map[string]float64 `json:"previous10_mean,omitempty"`
+}
+
+type HistoryMatch struct {
+	Date    string             `json:"date"`
+	ID      string             `json:"id"`
+	Map     string             `json:"map"`
+	Won     bool               `json:"won"`
+	Score   string             `json:"score"`
+	Metrics map[string]float64 `json:"metrics"`
+}
+
+// BuildHistory gathers, for each coached player, his last limit analysed
+// matches of the playlist.
+func BuildHistory(replays []*replay.Replay, reports map[string]*analysis.Report, players []string, playlist string, limit int) *History {
+	rs := slices.Clone(replays)
+	sort.Slice(rs, func(i, j int) bool { return rs[i].Date.Before(rs[j].Date) })
+	h := &History{Playlist: playlist, Notes: []string{
+		"Matchs de la même playlist, du plus ancien au plus récent (au plus " + fmt.Sprint(limit) + " par joueur).",
+		"metrics : colonnes d'analyse par match (mêmes clés que trends / analysis.json). last10_mean / previous10_mean : moyenne des 10 derniers matchs / des 10 d'avant.",
+	}}
+	byName := map[string]*PlayerHistory{}
+	var order []string
+	ms := map[string][]PlayerMatch{}
+	for _, r := range rs {
+		rep := reports[r.ID]
+		if rep == nil || rep.Playlist != playlist {
+			continue
+		}
+		us, them := r.Scores(players)
+		for _, name := range r.Coached(players) {
+			if len(players) > 0 && !slices.Contains(players, name) {
+				continue // recorder fallback: not one of the configured players
+			}
+			pm, ok := ForPlayer(rep, name)
+			if !ok {
+				continue
+			}
+			if byName[name] == nil {
+				byName[name] = &PlayerHistory{Name: name}
+				order = append(order, name)
+			}
+			m := HistoryMatch{Date: r.Date.Format("2006-01-02 15:04"), ID: r.ID, Map: r.Map, Won: us > them,
+				Score: fmt.Sprintf("%d-%d", us, them), Metrics: map[string]float64{}}
+			for _, met := range Metrics {
+				m.Metrics[met.Key] = met.Get(pm)
+			}
+			byName[name].Matches = append(byName[name].Matches, m)
+			ms[name] = append(ms[name], pm)
+		}
+	}
+	for _, name := range order {
+		ph := byName[name]
+		if len(ph.Matches) > limit {
+			ph.Matches = ph.Matches[len(ph.Matches)-limit:]
+		}
+		all := ms[name]
+		ph.Last10Mean = means(all[max(0, len(all)-10):])
+		if len(all) > 10 {
+			ph.Previous10Mean = means(all[max(0, len(all)-20) : len(all)-10])
+		}
+		h.Players = append(h.Players, *ph)
+	}
+	return h
+}
+
+func means(ms []PlayerMatch) map[string]float64 {
+	out := map[string]float64{}
+	for _, met := range Metrics {
+		out[met.Key] = mean(ms, met)
+	}
+	return out
+}

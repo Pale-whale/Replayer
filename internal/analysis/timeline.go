@@ -11,6 +11,8 @@ import (
 
 // Subset of `rrrocket -n` JSON output that we use.
 type netReplay struct {
+	// aliases renames players (alias -> main name), set by File.
+	aliases       map[string]string
 	Objects       []string `json:"objects"`
 	Names         []string `json:"names"`
 	NetworkFrames struct {
@@ -135,6 +137,7 @@ type timeline struct {
 	Touches []touch
 	// Index in Snaps of the first in-play frame after each kickoff countdown.
 	KickoffStarts []int
+	Playlist      int
 }
 
 type body struct {
@@ -248,7 +251,7 @@ func buildTimeline(nr *netReplay) *timeline {
 					}
 				}
 			case name == "PlayerName" && at.String != nil:
-				priName[u.ActorID] = *at.String
+				priName[u.ActorID] = alias(nr.aliases, *at.String)
 			case name == "Team" && at.ActiveActor != nil:
 				priTeam[u.ActorID] = at.ActiveActor.Actor
 			case name == "PlayerReplicationInfo" && at.ActiveActor != nil && at.ActiveActor.Active:
@@ -290,6 +293,8 @@ func buildTimeline(nr *netReplay) *timeline {
 						kickoffPending = true
 					}
 				}
+			case name == "ReplicatedGamePlaylist" && at.Int != nil:
+				tl.Playlist = *at.Int
 			case name == "SecondsRemaining" && at.Int != nil:
 				clock = *at.Int
 			case name == "bOverTime" && at.Boolean != nil:

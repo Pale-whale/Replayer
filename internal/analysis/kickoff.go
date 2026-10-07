@@ -22,6 +22,8 @@ type Kickoff struct {
 	// Team that scored within 10 s of the first touch, if any.
 	GoalWithin10s string          `json:"goal_within_10s,omitempty"`
 	Players       []KickoffPlayer `json:"players"`
+
+	touchTime float64 // replay time of the first touch
 }
 
 type KickoffPlayer struct {
@@ -67,7 +69,7 @@ func kickoffs(snaps []snapshot, starts []int, goals []replay.Goal) []Kickoff {
 			continue // nobody touched the ball (forfeit, end of match)
 		}
 		at := snaps[ai]
-		ko := Kickoff{Clock: fmtClock(start.Clock, start.Overtime), TimeToBall: round(at.Time - start.Time)}
+		ko := Kickoff{Clock: fmtClock(start.Clock, start.Overtime), TimeToBall: round(at.Time - start.Time), touchTime: at.Time}
 
 		var goer [2]string
 		best := [2]float64{kickoffGoerMaxDist, kickoffGoerMaxDist}

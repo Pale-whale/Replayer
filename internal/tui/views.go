@@ -8,6 +8,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
+	"replayer/internal/analysis"
+	"replayer/internal/coach"
 	"replayer/internal/trends"
 )
 
@@ -82,6 +84,7 @@ func (m Model) detailContent(it item) string {
 			label := teamStyle(p.Team).Render(pad(p.Name, labelWidth-2))
 			b.WriteString("  " + mark + label + metricCells(func(met trends.Metric) string { return num(met.Get(pm)) }) + "\n")
 		}
+		b.WriteString(m.refRow(rep.Playlist))
 		won := map[string]int{}
 		for _, ko := range rep.Kickoffs {
 			won[ko.Winner]++
@@ -90,7 +93,13 @@ func (m Model) detailContent(it item) string {
 			blueStyle.Render("bleu"), won["bleu"], orangeStyle.Render("orange"), won["orange"], won["neutre"])
 	}
 
-	if len(r.Goals) > 0 {
+	if rep := m.reports[r.ID]; rep != nil && len(rep.Goals) > 0 {
+		b.WriteString("  " + titleStyle.Render("Buts") + "\n\n")
+		for _, g := range rep.Goals {
+			fmt.Fprintf(&b, "  But %s — %s, 2 s avant\n", g.Clock, teamStyle(g.ScoringTeam).Render(g.Scorer))
+			b.WriteString(colorMap(g.FieldMap) + "\n")
+		}
+	} else if len(r.Goals) > 0 {
 		b.WriteString("  " + titleStyle.Render("Buts") + "\n")
 		for _, g := range r.Goals {
 			s := int(g.Second)
@@ -136,6 +145,7 @@ func (m Model) trendsContent() string {
 		}
 		b.WriteString("  " + titleStyle.Render(pad("Moyenne", labelWidth)) +
 			metricCells(func(met trends.Metric) string { return num(pt.Mean[met.Key]) }) + "\n")
+		b.WriteString(m.refRow(coach.DominantPlaylist(m.trendReplays, m.reports)))
 		if len(pt.Evolution) > 0 {
 			b.WriteString("  " + pad("Évolution (réc.-anc.)", labelWidth) + metricCells(func(met trends.Metric) string {
 				v := pt.Evolution[met.Key]
@@ -155,7 +165,58 @@ func (m Model) legend() string {
 	for _, met := range trends.Metrics {
 		parts = append(parts, met.Label+" "+met.Help)
 	}
+	parts = append(parts, "Réf. = médiane des joueurs de même niveau (compteurs ramenés à 5 min de jeu)")
 	return dimStyle.PaddingLeft(2).Width(max(m.width-2, 20)).Render(strings.Join(parts, " · "))
+}
+
+// refRow shows the median of the level reference of the playlist.
+func (m Model) refRow(playlist string) string {
+	b := m.bench(playlist)
+	if b == nil {
+		return ""
+	}
+	label := fmt.Sprintf("%s (méd., n=%d)", b.Label(), b.Players)
+	return "  " + infoStyle.Render(pad(label, labelWidth)) + metricCells(func(met trends.Metric) string {
+		if st, ok := b.Stat(met.Key); ok {
+			return num(st.Median)
+		}
+		return "-"
+	}) + "\n"
+}
+
+// colorMap colors a field map: blue players, orange players and the ball
+// on the field, each legend line in its team color.
+func colorMap(lines []string) string {
+	var b strings.Builder
+	for i, line := range lines {
+		switch {
+		case i == 0:
+			line = strings.Replace(strings.Replace(line, "BLEU", blueStyle.Render("BLEU"), 1), "ORANGE", orangeStyle.Render("ORANGE"), 1)
+		case i < analysis.MapRows:
+			var l strings.Builder
+			for _, c := range line {
+				switch {
+				case c >= '1' && c <= '9':
+					l.WriteString(blueStyle.Render(string(c)))
+				case c >= 'A' && c <= 'Z':
+					l.WriteString(orangeStyle.Render(string(c)))
+				case c == 'o':
+					l.WriteString(titleStyle.Render("o"))
+				case c == ' ':
+					l.WriteRune(c)
+				default:
+					l.WriteString(dimStyle.Render(string(c)))
+				}
+			}
+			line = l.String()
+		case len(line) > 2 && line[2] >= '1' && line[2] <= '9':
+			line = blueStyle.Render(line)
+		case len(line) > 2 && line[2] >= 'A' && line[2] <= 'Z':
+			line = orangeStyle.Render(line)
+		}
+		b.WriteString("  " + line + "\n")
+	}
+	return b.String()
 }
 
 func metricsHeader(label string) string {
@@ -165,7 +226,7 @@ func metricsHeader(label string) string {
 func metricCells(cell func(trends.Metric) string) string {
 	var b strings.Builder
 	for _, met := range trends.Metrics {
-		fmt.Fprintf(&b, " %6s", cell(met))
+		fmt.Fprintf(&b, " %5s", cell(met))
 	}
 	return b.String()
 }
